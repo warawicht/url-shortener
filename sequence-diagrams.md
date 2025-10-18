@@ -597,4 +597,241 @@ sequenceDiagram
     WS->>WS: Remove client from subscribers
 ```
 
-These sequence diagrams provide detailed technical specifications for all major use cases in the URL shortening service, showing the exact flow of data between components, error handling paths, and performance optimizations like caching strategies.
+## 8. Password Reset Use Case
+
+### 8.1 Password Reset Flow
+
+```mermaid
+sequenceDiagram
+    participant User
+    participant Frontend as React Frontend
+    participant API as Go Backend API
+    participant DB as PostgreSQL
+    participant Email as Email Service
+    participant Cache as Redis
+    
+    User->>Frontend: Click "Forgot Password"
+    Frontend->>Frontend: Show password reset form
+    Frontend-->>User: Display email input field
+    
+    User->>Frontend: Enter email address
+    Frontend->>Frontend: Validate email format
+    Frontend->>API: POST /api/auth/forgot-password
+    Note over Frontend,API: Request: {email}
+    
+    API->>API: Rate limiting check (prevent abuse)
+    API->>Cache: GET reset_attempts:email_hash
+    Note over API,Cache: Check recent reset requests
+    
+    alt Too many reset attempts
+        API-->>Frontend: 429 Too Many Requests
+        Frontend-->>User: Show "Try again later" message
+    end
+    
+    API->>DB: SELECT * FROM users WHERE email = ?
+    DB-->>API: User record (if exists)
+    
+    alt Email not found
+        Note over API: Don't reveal email existence for security
+        API-->>Frontend: 200 OK (generic success message)
+        Frontend-->>User: "If email exists, reset link sent"
+    end
+    
+    API->>API: Generate secure reset token
+    Note over API: cryptographically secure random string, 32 chars
+    API->>API: Set token expiration (15 minutes)
+    
+    API->>DB: UPDATE users SET reset_token=?, reset_token_expires=?
+    Note over API,DB: Store hashed reset token
+    
+    API->>Cache: SET reset_token:token_hash with TTL 15min
+    Note over API,Cache: For quick token validation
+    
+    API->>Email: Send password reset email
+    Note over API,Email: Async: Send reset link with token
+    
+    API->>Cache: INCREMENT reset_attempts:email_hash
+    Note over API,Cache: Track reset attempts for rate limiting
+    
+    API-->>Frontend: 200 OK (success message)
+    Frontend-->>User: "Check your email for reset link"
+    
+    par Email Processing
+        User->>Email: Open password reset email
+        Email->>User: Click reset link: https://short.ly/reset?token=abc123
+        
+        User->>Browser: Navigate to reset page
+        Browser->>Frontend: Load reset password page with token
+        
+        Frontend->>API: GET /api/auth/validate-reset-token?token=abc123
+        API->>Cache: GET reset_token:token_hash
+        
+        alt Token valid and not expired
+            Cache-->>API: Token data
+            API-->>Frontend: 200 OK (token valid)
+            Frontend->>Frontend: Show password reset form
+            Frontend-->>User: Display new password fields
+        else Token invalid or expired
+            API-->>Frontend: 400 Bad Request (invalid token)
+            Frontend-->>User: "Reset link expired or invalid"
+        end
+        
+        User->>Frontend: Enter new password
+        User->>Frontend: Confirm new password
+        Frontend->>Frontend: Validate password requirements
+        Note over Frontend: Min 8 chars, uppercase, lowercase, number, special
+        
+        Frontend->>API: POST /api/auth/reset-password
+        Note over Frontend,API: {token, new_password, confirm_password}
+        
+        API->>Cache: GET reset_token:token_hash
+        alt Token valid
+            Cache-->>API: Token data
+            API->>API: Validate token expiration
+            API->>API: Hash new password with bcrypt (cost 12)
+            API->>DB: UPDATE users SET password_hash=?, reset_token=NULL, reset_token_expires=NULL
+            DB-->>API: Update confirmation
+            
+            API->>Cache: DELETE reset_token:token_hash
+            API->>Cache: DELETE reset_attempts:email_hash
+            Note over API,Cache: Clean up reset-related cache
+            
+            API->>API: Invalidate user sessions
+            Note over API: Force logout from all devices
+            
+            API-->>Frontend: 200 OK (password reset successful)
+            Frontend->>Frontend: Show success message
+            Frontend->>Frontend: Redirect to login page
+            Frontend-->>User: "Password reset successful, please login"
+        else Token invalid
+            API-->>Frontend: 400 Bad Request
+            Frontend-->>User: "Reset link expired, request new one"
+        end
+    end
+```
+
+### 8.2 Password Reset Security Measures
+
+```mermaid
+sequenceDiagram
+    participant Attacker
+    participant API as Go Backend API
+    participant Cache as Redis
+    participant DB as PostgreSQL
+    participant Security as Security Service
+    
+    Note over Attacker,Security: Scenario 1: Brute force reset attempts
+    Attacker->>API: POST /api/auth/forgot-password (email1@example.com)
+    API->>Cache: INCREMENT reset_attempts:email1_hash
+    API->>Email: Send reset email
+    
+    loop Multiple rapid attempts
+        Attacker->>API: POST /api/auth/forgot-password (email1@example.com)
+        API->>Cache: GET reset_attempts:email1_hash
+        alt Rate limit exceeded (>5 attempts per hour)
+            Cache-->>API: Count > 5
+            API-->>Attacker: 429 Too Many Requests
+        end
+    end
+    
+    Note over Attacker,Security: Scenario 2: Token tampering
+    Attacker->>API: POST /api/auth/reset-password
+    Note over Attacker,API: {token: "tampered_token", new_password: "newpass123"}
+    
+    API->>Cache: GET reset_token:tampered_token_hash
+    Cache-->>API: Token not found
+    API-->>Attacker: 400 Bad Request (invalid token)
+    
+    Note over Attacker,Security: Scenario 3: Token reuse
+    User->>API: POST /api/auth/reset-password (valid token)
+    API->>DB: Update password, clear token
+    API->>Cache: DELETE reset_token:token_hash
+    
+    Attacker->>API: POST /api/auth/reset-password
+    Note over Attacker,API: {token: "already_used_token", new_password: "hackpass123"}
+    
+    API->>Cache: GET reset_token:already_used_hash
+    Cache-->>API: Token not found (already deleted)
+    API-->>Attacker: 400 Bad Request (invalid token)
+    
+    Note over Attacker,Security: Scenario 4: Email enumeration protection
+    Attacker->>API: POST /api/auth/forgot-password
+    Note over Attacker,API: {email: "nonexistent@example.com"}
+    
+    API->>DB: SELECT * FROM users WHERE email = "nonexistent@example.com"
+    DB-->>API: No user found
+    
+    API->>Security: Generate fake success response
+    Note over API,Security: Always return success to prevent email enumeration
+    API-->>Attacker: 200 OK (same response as valid email)
+```
+
+### 8.3 Password Reset with Account Lockout
+
+```mermaid
+sequenceDiagram
+    participant User
+    participant API as Go Backend API
+    participant DB as PostgreSQL
+    participant Cache as Redis
+    participant Security as Security Service
+    
+    Note over User,Security: Scenario: Multiple failed login attempts trigger lockout
+    
+    loop Failed login attempts
+        User->>API: POST /api/auth/login
+        Note over User,API: {email: "user@example.com", password: "wrong_password"}
+        
+        API->>DB: SELECT * FROM users WHERE email = "user@example.com"
+        DB-->>API: User record
+        
+        API->>Cache: INCREMENT failed_attempts:user_id
+        API->>Cache: GET failed_attempts:user_id
+        
+        alt Attempts < 5
+            Cache-->>API: Count < 5
+            API-->>User: 401 Unauthorized
+        else Attempts >= 5
+            Cache-->>API: Count >= 5
+            API->>Security: Lock user account
+            API->>DB: UPDATE users SET account_locked=true, lock_expires=NOW() + 30 minutes
+            API-->>User: 423 Locked (Account temporarily locked)
+        end
+    end
+    
+    User->>Frontend: Try to reset password
+    User->>API: POST /api/auth/forgot-password
+    Note over User,API: {email: "user@example.com"}
+    
+    API->>DB: SELECT * FROM users WHERE email = "user@example.com"
+    DB-->>API: User record (account_locked=true)
+    
+    API->>Security: Check account lock status
+    alt Account is locked
+        API->>API: Generate reset token anyway (allow password reset for locked accounts)
+        API->>DB: UPDATE users SET reset_token=?, reset_token_expires=?
+        API->>Email: Send reset email with special notice
+        Note over API,Email: "Account locked due to suspicious activity"
+        API-->>User: 200 OK (reset email sent)
+    end
+    
+    User->>Email: Complete password reset
+    User->>API: POST /api/auth/reset-password
+    Note over User,API: {token, new_password}
+    
+    API->>Cache: GET reset_token:token_hash
+    Cache-->>API: Valid token
+    
+    API->>Security: Reset security metrics
+    API->>DB: UPDATE users SET password_hash=?, reset_token=NULL, account_locked=false, lock_expires=NULL
+    API->>Cache: DELETE failed_attempts:user_id
+    Note over API,Cache: Clear all security-related cache
+    
+    API->>Email: Send security notification
+    Note over API,Email: "Your password was reset and account unlocked"
+    
+    API-->>User: 200 OK (password reset successful)
+    Frontend-->>User: "Password reset and account unlocked"
+```
+
+These sequence diagrams provide detailed technical specifications for all major use cases in the URL shortening service, showing the exact flow of data between components, error handling paths, security measures, and performance optimizations like caching strategies.
