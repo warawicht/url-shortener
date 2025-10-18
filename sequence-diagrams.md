@@ -834,4 +834,288 @@ sequenceDiagram
     Frontend-->>User: "Password reset and account unlocked"
 ```
 
-These sequence diagrams provide detailed technical specifications for all major use cases in the URL shortening service, showing the exact flow of data between components, error handling paths, security measures, and performance optimizations like caching strategies.
+## 9. API Rate Limiting Use Case
+
+### 9.1 Rate Limiting Enforcement
+
+```mermaid
+sequenceDiagram
+    participant Client as API Client
+    participant Nginx as Reverse Proxy
+    participant API as Go Backend API
+    participant RateLimit as Rate Limiter
+    participant Cache as Redis
+    participant DB as PostgreSQL
+    participant Alert as Alert Service
+    
+    Note over Client,Alert: Scenario 1: Normal API usage within limits
+    Client->>Nginx: GET /api/urls/history
+    Nginx->>API: Forward request with client IP
+    
+    API->>RateLimit: Check rate limit
+    RateLimit->>Cache: GET rate_limit:client_ip:api_urls_history:minute
+    Cache-->>RateLimit: Current count (e.g., 5/100)
+    
+    alt Within limits
+        RateLimit-->>API: Allow request
+        API->>DB: Execute business logic
+        DB-->>API: Return data
+        API->>RateLimit: Increment counter
+        RateLimit->>Cache: INCR rate_limit:client_ip:api_urls_history:minute
+        RateLimit->>Cache: EXPIRE rate_limit:client_ip:api_urls_history:minute 60
+        API-->>Client: 200 OK with data
+    end
+    
+    Note over Client,Alert: Scenario 2: Rate limit exceeded
+    loop Rapid requests (exceeding 100/minute)
+        Client->>Nginx: GET /api/urls/history
+        Nginx->>API: Forward request
+        
+        API->>RateLimit: Check rate limit
+        RateLimit->>Cache: GET rate_limit:client_ip:api_urls_history:minute
+        Cache-->>RateLimit: Current count (e.g., 100/100)
+        
+        RateLimit-->>API: Rate limit exceeded
+        API-->>Client: 429 Too Many Requests
+        Note over API,Client: Headers: Retry-After: 60, X-RateLimit-Limit: 100, X-RateLimit-Remaining: 0
+    end
+    
+    API->>Alert: Log rate limit violation
+    Note over API,Alert: {ip, endpoint, count, timestamp}
+    Alert->>Alert: Check for abuse patterns
+```
+
+### 9.2 Multi-Level Rate Limiting
+
+```mermaid
+sequenceDiagram
+    participant Client as API Client
+    participant API as Go Backend API
+    participant RateLimit as Rate Limiter
+    participant Cache as Redis
+    participant User as Authenticated User
+    
+    Note over Client,User: Scenario 1: Anonymous user rate limiting
+    Client->>API: POST /api/urls/shorten (no auth)
+    API->>RateLimit: Check anonymous rate limit
+    RateLimit->>Cache: GET rate_limit:client_ip:anonymous_shorten:hour
+    Cache-->>RateLimit: Current count (e.g., 8/10)
+    
+    alt Within anonymous limits
+        RateLimit-->>API: Allow request
+        API->>API: Process URL shortening
+        RateLimit->>Cache: INCR rate_limit:client_ip:anonymous_shorten:hour
+        RateLimit->>Cache: EXPIRE rate_limit:client_ip:anonymous_shorten:hour 3600
+        API-->>Client: 201 Created
+    else Anonymous limit exceeded
+        RateLimit-->>API: Reject request
+        API-->>Client: 429 Too Many Requests
+        Note over API,Client: Message: "Anonymous limit exceeded. Register for higher limits."
+    end
+    
+    Note over Client,User: Scenario 2: Authenticated user rate limiting
+    User->>API: POST /api/urls/shorten (with JWT)
+    API->>RateLimit: Check authenticated rate limit
+    RateLimit->>Cache: GET rate_limit:user_id:authenticated_shorten:hour
+    Cache-->>RateLimit: Current count (e.g., 45/1000)
+    
+    alt Within authenticated limits
+        RateLimit-->>API: Allow request
+        API->>API: Process URL shortening
+        RateLimit->>Cache: INCR rate_limit:user_id:authenticated_shorten:hour
+        RateLimit->>Cache: EXPIRE rate_limit:user_id:authenticated_shorten:hour 3600
+        API-->>User: 201 Created
+    end
+    
+    Note over Client,User: Scenario 3: Premium user rate limiting
+    User->>API: POST /api/urls/shorten (premium user)
+    API->>RateLimit: Check premium rate limit
+    RateLimit->>Cache: GET rate_limit:user_id:premium_shorten:hour
+    Cache-->>RateLimit: Current count (e.g., 5000/10000)
+    
+    RateLimit-->>API: Allow request
+    API->>API: Process URL shortening
+    RateLimit->>Cache: INCR rate_limit:user_id:premium_shorten:hour
+    RateLimit->>Cache: EXPIRE rate_limit:user_id:premium_shorten:hour 3600
+    API-->>User: 201 Created
+```
+
+### 9.3 Rate Limiting with Sliding Window
+
+```mermaid
+sequenceDiagram
+    participant Client as API Client
+    participant API as Go Backend API
+    participant RateLimit as Rate Limiter
+    participant Cache as Redis
+    participant Time as Time Service
+    
+    Note over Client,Time: Scenario: Sliding window rate limiting (100 requests per minute)
+    
+    Client->>API: Request #1 at 00:00:00
+    API->>RateLimit: Check sliding window
+    RateLimit->>Cache: ZADD rate_limit:client_ip:api_calls 00:00:00 request_id_1
+    RateLimit->>Cache: ZREMRANGEBYSCORE rate_limit:client_ip:api_calls -inf 00:59:00
+    RateLimit->>Cache: ZCARD rate_limit:client_ip:api_calls
+    Cache-->>RateLimit: Count = 1
+    RateLimit-->>API: Allow (1/100)
+    API-->>Client: 200 OK
+    
+    Client->>API: Request #50 at 00:30:00
+    API->>RateLimit: Check sliding window
+    RateLimit->>Cache: ZADD rate_limit:client_ip:api_calls 00:30:00 request_id_50
+    RateLimit->>Cache: ZREMRANGEBYSCORE rate_limit:client_ip:api_calls -inf 00:59:00
+    RateLimit->>Cache: ZCARD rate_limit:client_ip:api_calls
+    Cache-->>RateLimit: Count = 50
+    RateLimit-->>API: Allow (50/100)
+    API-->>Client: 200 OK
+    
+    Client->>API: Request #100 at 00:59:00
+    API->>RateLimit: Check sliding window
+    RateLimit->>Cache: ZADD rate_limit:client_ip:api_calls 00:59:00 request_id_100
+    RateLimit->>Cache: ZREMRANGEBYSCORE rate_limit:client_ip:api_calls -inf 00:59:00
+    RateLimit->>Cache: ZCARD rate_limit:client_ip:api_calls
+    Cache-->>RateLimit: Count = 100
+    RateLimit-->>API: Allow (100/100)
+    API-->>Client: 200 OK
+    
+    Client->>API: Request #101 at 01:00:01
+    API->>RateLimit: Check sliding window
+    RateLimit->>Cache: ZADD rate_limit:client_ip:api_calls 01:00:01 request_id_101
+    RateLimit->>Cache: ZREMRANGEBYSCORE rate_limit:client_ip:api_calls 00:01:01 01:00:01
+    RateLimit->>Cache: ZCARD rate_limit:client_ip:api_calls
+    Cache-->>RateLimit: Count = 1 (only requests from 00:01:01 to 01:00:01)
+    RateLimit-->>API: Allow (1/100)
+    API-->>Client: 200 OK
+    
+    Note over Client,Time: Sliding window automatically adjusts, allowing new requests as old ones expire
+```
+
+### 9.4 Distributed Rate Limiting
+
+```mermaid
+sequenceDiagram
+    participant LB as Load Balancer
+    participant API1 as API Server 1
+    participant API2 as API Server 2
+    participant API3 as API Server 3
+    participant Cache as Redis Cluster
+    participant Client as API Client
+    
+    Note over Client,Cache: Multiple API servers sharing rate limit state
+    
+    Client->>LB: Request #1
+    LB->>API1: Route to server 1
+    API1->>Cache: INCR rate_limit:client_ip:api_calls:minute
+    Cache-->>API1: Count = 1
+    API1->>Cache: EXPIRE rate_limit:client_ip:api_calls:minute 60
+    API1-->>Client: 200 OK
+    
+    Client->>LB: Request #2
+    LB->>API2: Route to server 2
+    API2->>Cache: INCR rate_limit:client_ip:api_calls:minute
+    Cache-->>API2: Count = 2
+    API2-->>Client: 200 OK
+    
+    Client->>LB: Request #3
+    LB->>API3: Route to server 3
+    API3->>Cache: INCR rate_limit:client_ip:api_calls:minute
+    Cache-->>API3: Count = 3
+    API3-->>Client: 200 OK
+    
+    Note over Client,Cache: All servers see the same counter due to shared Redis
+    
+    par Rapid requests from different servers
+        Client->>LB: Request #98
+        LB->>API1: Route to server 1
+        API1->>Cache: INCR rate_limit:client_ip:api_calls:minute
+        Cache-->>API1: Count = 98
+        API1-->>Client: 200 OK
+        
+        Client->>LB: Request #99
+        LB->>API2: Route to server 2
+        API2->>Cache: INCR rate_limit:client_ip:api_calls:minute
+        Cache-->>API2: Count = 99
+        API2-->>Client: 200 OK
+        
+        Client->>LB: Request #100
+        LB->>API3: Route to server 3
+        API3->>Cache: INCR rate_limit:client_ip:api_calls:minute
+        Cache-->>API3: Count = 100
+        API3-->>Client: 200 OK
+        
+        Client->>LB: Request #101
+        LB->>API1: Route to server 1
+        API1->>Cache: INCR rate_limit:client_ip:api_calls:minute
+        Cache-->>API1: Count = 101
+        API1-->>Client: 429 Too Many Requests
+    end
+```
+
+### 9.5 Rate Limiting Bypass Detection
+
+```mermaid
+sequenceDiagram
+    participant Attacker as Malicious Client
+    participant API as Go Backend API
+    participant RateLimit as Rate Limiter
+    participant Cache as Redis
+    participant Security as Security Service
+    participant Alert as Alert Service
+    
+    Note over Attacker,Alert: Scenario: Attacker trying to bypass rate limits
+    
+    Attacker->>API: Request from IP 192.168.1.100
+    API->>RateLimit: Check rate limit
+    RateLimit->>Cache: GET rate_limit:192.168.1.100:api_calls:minute
+    Cache-->>RateLimit: Count = 99
+    RateLimit-->>API: Allow
+    API-->>Attacker: 200 OK
+    
+    Attacker->>API: Request from IP 192.168.1.100 (limit reached)
+    API->>RateLimit: Check rate limit
+    RateLimit->>Cache: GET rate_limit:192.168.1.100:api_calls:minute
+    Cache-->>RateLimit: Count = 100
+    RateLimit-->>API: Rate limit exceeded
+    API-->>Attacker: 429 Too Many Requests
+    
+    Note over Attacker,Security: Attacker switches to different IP
+    Attacker->>API: Request from IP 192.168.1.101
+    API->>RateLimit: Check rate limit
+    RateLimit->>Security: Check for suspicious patterns
+    
+    Security->>Cache: GET suspicious_pattern:user_agent:timestamp
+    Note over Security,Cache: Check if same user agent made requests from multiple IPs
+    
+    alt Suspicious pattern detected
+        Security->>Cache: SET suspicious_pattern:user_agent:timestamp "multiple_ips" EX 3600
+        Security->>Alert: Report potential rate limit bypass
+        Note over Security,Alert: {user_agent, ip_list, pattern, timestamp}
+        Alert->>Alert: Analyze for automated attacks
+        
+        Security->>RateLimit: Apply stricter limits
+        RateLimit->>Cache: SET rate_limit:192.168.1.101:api_calls:minute 5 EX 60
+        Note over RateLimit,Cache: Reduced limit for suspicious IP
+    end
+    
+    RateLimit-->>API: Allow with reduced limits
+    API-->>Attacker: 200 OK
+    
+    Note over Attacker,Security: Attacker tries multiple User-Agent headers
+    loop Different User-Agent attempts
+        Attacker->>API: Request with new User-Agent
+        API->>Security: Check pattern
+        Security->>Cache: GET bypass_attempts:network_range:192.168.1.0/24:hour
+        Cache-->>Security: Attempt count for network range
+        
+        alt High bypass attempts detected
+            Security->>Alert: Escalate to network-level blocking
+            Alert->>Alert: Trigger automated response
+            Security->>RateLimit: Block entire network range
+            RateLimit-->>API: Block request
+            API-->>Attacker: 403 Forbidden
+        end
+    end
+```
+
+These sequence diagrams provide detailed technical specifications for all major use cases in the URL shortening service, showing the exact flow of data between components, error handling paths, comprehensive security measures, and performance optimizations like caching strategies and distributed rate limiting.
