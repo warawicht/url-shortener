@@ -164,7 +164,7 @@ sequenceDiagram
     participant Visitor
     participant API as Go Backend API
     participant GeoIP as GeoIP Service
-    Device as Device Parser
+    participant Device as Device Parser
     participant DB as PostgreSQL
     participant Cache as Redis
     
