@@ -1118,4 +1118,330 @@ sequenceDiagram
     end
 ```
 
-These sequence diagrams provide detailed technical specifications for all major use cases in the URL shortening service, showing the exact flow of data between components, error handling paths, comprehensive security measures, and performance optimizations like caching strategies and distributed rate limiting.
+## 10. Bulk URL Operations Use Case
+
+### 10.1 Bulk URL Import
+
+```mermaid
+sequenceDiagram
+    participant User
+    participant Frontend as React Frontend
+    participant API as Go Backend API
+    participant Queue as Job Queue
+    participant Worker as Background Worker
+    participant DB as PostgreSQL
+    participant Cache as Redis
+    participant Storage as File Storage
+    
+    User->>Frontend: Navigate to bulk import page
+    Frontend->>Frontend: Show import interface
+    Frontend-->>User: Display file upload options
+    
+    User->>Frontend: Upload CSV/Excel file
+    Frontend->>Frontend: Validate file format and size
+    Note over Frontend: Check file extension, max size 10MB
+    
+    Frontend->>API: POST /api/urls/bulk/import
+    Note over Frontend,API: Multipart form with file
+    
+    API->>API: Validate authentication and rate limits
+    API->>API: Save uploaded file to temporary storage
+    API->>Storage: PUT temp/files/user_id/import_timestamp.csv
+    Storage-->>API: File saved successfully
+    
+    API->>Queue: Create bulk import job
+    Note over API,Queue: Job: {user_id, file_path, format, options}
+    Queue-->>API: Job ID returned
+    
+    API->>Cache: SET import_status:job_id "processing" EX 3600
+    API-->>Frontend: 202 Accepted with job ID
+    Frontend->>Frontend: Show processing status
+    Frontend-->>User: "Import started, processing in background"
+    
+    par Background Processing
+        Worker->>Queue: Get next bulk import job
+        Queue-->>Worker: Job details
+        
+        Worker->>Storage: GET temp/files/user_id/import_timestamp.csv
+        Storage-->>Worker: File content
+        
+        Worker->>Worker: Parse CSV/Excel file
+        Note over Worker: Validate headers, extract URLs
+        
+        loop Process each URL row
+            Worker->>Worker: Validate URL format
+            alt Valid URL
+                Worker->>Worker: Generate short code
+                Worker->>DB: INSERT into urls table
+                Note over Worker,DB: Batch insert for performance
+                Worker->>Cache: Cache new URL mapping
+            else Invalid URL
+                Worker->>DB: INSERT into import_errors table
+                Note over Worker,DB: Log error for user review
+            end
+        end
+        
+        Worker->>DB: UPDATE import_jobs SET status="completed", processed_count=100, error_count=5
+        Worker->>Cache: SET import_status:job_id "completed" EX 86400
+        Worker->>Storage: DELETE temp/files/user_id/import_timestamp.csv
+    end
+    
+    par Real-time Status Updates
+        Frontend->>API: GET /api/urls/bulk/import/status/:jobId
+        API->>Cache: GET import_status:job_id
+        Cache-->>API: Current status
+        API-->>Frontend: Status response
+        Frontend->>Frontend: Update progress bar
+        
+        loop Status polling every 2 seconds
+            Frontend->>API: GET /api/urls/bulk/import/status/:jobId
+            API->>Cache: GET import_status:job_id
+            Cache-->>API: "completed"
+            API-->>Frontend: Import completed
+            Frontend->>Frontend: Show completion summary
+            Frontend-->>User: "Import completed: 100 URLs created, 5 errors"
+        end
+    end
+```
+
+### 10.2 Bulk URL Export
+
+```mermaid
+sequenceDiagram
+    participant User
+    participant Frontend as React Frontend
+    participant API as Go Backend API
+    participant Queue as Job Queue
+    participant Worker as Background Worker
+    participant DB as PostgreSQL
+    participant Cache as Redis
+    participant Storage as File Storage
+    participant Email as Email Service
+    
+    User->>Frontend: Navigate to bulk export page
+    Frontend->>Frontend: Show export options
+    Frontend-->>User: Display filters and format options
+    
+    User->>Frontend: Select export criteria
+    Note over User,Frontend: Date range, URL status, format (CSV/Excel)
+    User->>Frontend: Click "Export URLs"
+    
+    Frontend->>API: POST /api/urls/bulk/export
+    Note over Frontend,API: {date_range, filters, format, include_analytics}
+    
+    API->>API: Validate authentication and user permissions
+    API->>Queue: Create bulk export job
+    Note over API,Queue: Job: {user_id, criteria, format, options}
+    Queue-->>API: Job ID returned
+    
+    API->>Cache: SET export_status:job_id "processing" EX 3600
+    API-->>Frontend: 202 Accepted with job ID
+    Frontend->>Frontend: Show processing status
+    Frontend-->>User: "Export started, processing in background"
+    
+    par Background Processing
+        Worker->>Queue: Get next bulk export job
+        Queue-->>Worker: Job details
+        
+        Worker->>DB: SELECT urls WHERE user_id = ? AND criteria
+        Note over Worker,DB: Query with date range and filters
+        DB-->>Worker: URL records (potentially thousands)
+        
+        alt Include analytics requested
+            Worker->>DB: LEFT JOIN analytics ON urls.id = analytics.url_id
+            DB-->>Worker: URLs with analytics data
+        end
+        
+        Worker->>Worker: Generate export file
+        alt CSV format
+            Worker->>Worker: Create CSV with headers
+            Note over Worker: short_url, original_url, click_count, created_at
+        else Excel format
+            Worker->>Worker: Create Excel with multiple sheets
+            Note over Worker: URLs sheet, Analytics sheet, Charts
+        end
+        
+        Worker->>Storage: PUT exports/user_id/export_timestamp.xlsx
+        Storage-->>Worker: File saved successfully
+        
+        Worker->>DB: UPDATE export_jobs SET status="completed", file_path=..., record_count=1000
+        Worker->>Cache: SET export_status:job_id "completed" EX 86400
+        
+        Worker->>Email: Send export completion email
+        Note over Worker,Email: Include download link and expiry time
+    end
+    
+    par Real-time Status Updates
+        Frontend->>API: GET /api/urls/bulk/export/status/:jobId
+        API->>Cache: GET export_status:job_id
+        Cache-->>API: Current status
+        API-->>Frontend: Status response
+        
+        loop Status polling every 3 seconds
+            Frontend->>API: GET /api/urls/bulk/export/status/:jobId
+            API->>Cache: GET export_status:job_id
+            Cache-->>API: "completed"
+            API-->>Frontend: Export completed
+            
+            Frontend->>API: GET /api/urls/bulk/export/download/:jobId
+            API->>DB: SELECT file_path FROM export_jobs WHERE job_id = ?
+            DB-->>API: File path
+            API->>Storage: GET exports/user_id/export_timestamp.xlsx
+            Storage-->>API: File content
+            API-->>Frontend: File download
+            Frontend->>Frontend: Trigger file download
+            Frontend-->>User: Download Excel file
+        end
+    end
+```
+
+### 10.3 Bulk URL Operations Management
+
+```mermaid
+sequenceDiagram
+    participant User
+    participant Frontend as React Frontend
+    participant API as Go Backend API
+    participant DB as PostgreSQL
+    participant Cache as Redis
+    participant Queue as Job Queue
+    
+    User->>Frontend: Navigate to bulk operations dashboard
+    Frontend->>API: GET /api/urls/bulk/operations
+    Note over Frontend,API: Query: page=1, limit=20, type=all
+    
+    API->>DB: SELECT import_jobs, export_jobs WHERE user_id = ?
+    Note over API,DB: ORDER BY created_at DESC
+    DB-->>API: Operations list with status
+    API-->>Frontend: Operations data
+    Frontend->>Frontend: Render operations dashboard
+    
+    User->>Frontend: View import job details
+    Frontend->>API: GET /api/urls/bulk/import/:jobId/details
+    API->>DB: SELECT import_errors WHERE job_id = ?
+    DB-->>API: Error records
+    API-->>Frontend: Import errors and statistics
+    Frontend-->>User: Show success/failure summary
+    
+    User->>Frontend: Retry failed imports
+    Frontend->>API: POST /api/urls/bulk/retry/:jobId
+    Note over Frontend,API: Retry only failed records
+    
+    API->>DB: SELECT import_errors WHERE job_id = ? AND status = "failed"
+    DB-->>API: Failed records
+    API->>Queue: Create retry job with failed records
+    Queue-->>API: New job ID
+    API-->>Frontend: Retry job created
+    Frontend-->>User: "Retry started for failed URLs"
+    
+    User->>Frontend: Cancel ongoing operation
+    Frontend->>API: POST /api/urls/bulk/cancel/:jobId
+    
+    API->>Queue: Cancel job by ID
+    Queue-->>API: Cancellation confirmation
+    API->>DB: UPDATE jobs SET status="cancelled"
+    API->>Cache: SET operation_status:job_id "cancelled"
+    
+    User->>Frontend: Delete old export file
+    Frontend->>API: DELETE /api/urls/bulk/export/:jobId
+    
+    API->>API: Validate user ownership
+    API->>DB: SELECT file_path FROM export_jobs WHERE job_id = ? AND user_id = ?
+    DB-->>API: File path
+    API->>Storage: DELETE exports/user_id/export_timestamp.xlsx
+    Storage-->>API: File deleted
+    API->>DB: UPDATE export_jobs SET file_path=NULL, status="deleted"
+    API-->>Frontend: 204 No Content
+    Frontend-->>User: Export file deleted
+```
+
+### 10.4 Bulk URL Updates
+
+```mermaid
+sequenceDiagram
+    participant User
+    participant Frontend as React Frontend
+    participant API as Go Backend API
+    participant Queue as Job Queue
+    participant Worker as Background Worker
+    participant DB as PostgreSQL
+    participant Cache as Redis
+    
+    User->>Frontend: Navigate to bulk update page
+    Frontend->>API: GET /api/urls/history?limit=1000
+    API->>DB: SELECT urls WHERE user_id = ? LIMIT 1000
+    DB-->>API: URL list
+    API-->>Frontend: URLs data
+    Frontend->>Frontend: Render bulk update interface
+    
+    User->>Frontend: Select URLs to update
+    User->>Frontend: Choose update operation
+    Note over User,Frontend: Options: Update expiration, add password, change alias
+    
+    User->>Frontend: Configure update settings
+    Note over User,Frontend: New expiration date, password, etc.
+    User->>Frontend: Click "Apply Updates"
+    
+    Frontend->>API: POST /api/urls/bulk/update
+    Note over Frontend,API: {url_ids, update_data, operation}
+    
+    API->>API: Validate update data
+    API->>API: Check rate limits for bulk operations
+    API->>Queue: Create bulk update job
+    Note over API,Queue: Job: {user_id, url_ids, update_data, operation}
+    Queue-->>API: Job ID returned
+    
+    API->>Cache: SET update_status:job_id "processing" EX 3600
+    API-->>Frontend: 202 Accepted with job ID
+    Frontend-->>User: "Bulk update started"
+    
+    par Background Processing
+        Worker->>Queue: Get next bulk update job
+        Queue-->>Worker: Job details
+        
+        loop Process each URL
+            Worker->>DB: SELECT * FROM urls WHERE id = ? AND user_id = ?
+            DB-->>Worker: URL record
+            
+            Worker->>Worker: Apply update operation
+            alt Update expiration date
+                Worker->>DB: UPDATE urls SET expires_at = ? WHERE id = ?
+            else Add password protection
+                Worker->>Worker: Hash new password
+                Worker->>DB: UPDATE urls SET password_hash = ? WHERE id = ?
+            else Change custom alias
+                Worker->>DB: Check alias availability
+                alt Alias available
+                    Worker->>DB: UPDATE urls SET custom_alias = ? WHERE id = ?
+                else Alias taken
+                    Worker->>DB: INSERT into update_errors table
+                end
+            end
+            
+            Worker->>Cache: Invalidate URL cache
+            Note over Worker,Cache: DELETE url:short_code
+        end
+        
+        Worker->>DB: UPDATE update_jobs SET status="completed", updated_count=95, error_count=5
+        Worker->>Cache: SET update_status:job_id "completed" EX 86400
+    end
+    
+    par Real-time Progress Updates
+        Frontend->>API: GET /api/urls/bulk/update/status/:jobId
+        API->>Cache: GET update_status:jobId
+        Cache-->>API: Current status and progress
+        API-->>Frontend: Progress update
+        Frontend->>Frontend: Update progress bar
+        
+        loop Progress updates
+            Frontend->>API: GET /api/urls/bulk/update/status/:jobId
+            API->>Cache: GET update_status:jobId
+            Cache-->>API: "completed"
+            API-->>Frontend: Update completed
+            Frontend->>Frontend: Show completion summary
+            Frontend-->>User: "95 URLs updated, 5 errors"
+        end
+    end
+```
+
+These sequence diagrams provide detailed technical specifications for all major use cases in the URL shortening service, showing the exact flow of data between components, comprehensive security measures, performance optimizations like caching strategies and distributed rate limiting, and enterprise features like bulk operations with background job processing.
